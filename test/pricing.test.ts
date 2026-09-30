@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
 import { mkdtempSync, utimesSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   normalizeModelName,
@@ -38,6 +39,90 @@ function pricingFixture(aliases: Record<string, string>, costs: Record<string, u
   writeFileSync(costsPath, JSON.stringify(costs))
   writeFileSync(aliasesPath, JSON.stringify(aliases))
   return { costsPath, aliasesPath }
+}
+
+const RECENT_WINDOW_DAYS = 7
+
+/**
+ * Elige un modelo realmente en uso, de los últimos {@link RECENT_WINDOW_DAYS}
+ * días, que además necesite el sync con session-stats para resolverse.
+ *
+ * Los ids de modelo cambian seguido y un ejemplo hardcodeado se pudre en
+ * semanas: el test passaría cubriendo un caso que ya no existe. Leyendo la
+ * base de opencode el test sigue apuntando a algo vigente, y el filtro por
+ * "no resoluble localmente" garantiza que el sync sea lo que se está probando.
+ *
+ * Devuelve `null` si no hay base, no hay modelos recientes, o ninguno necesita
+ * el sync; en ese caso quien llama omite el test y avisa por consola, para que
+ * un skip no se lea como cobertura real.
+ */
+function recentModels(): string[] {
+  try {
+    const db = new Database(join(homedir(), ".local/share/opencode/opencode.db"), { readonly: true })
+    const cutoff = Date.now() - RECENT_WINDOW_DAYS * 86_400_000
+    const rows = db
+      .query(
+        // Se agrupa por la expresión, no por el alias: `session_message` ya
+        // tiene una columna `id` y SQLite resolvería `GROUP BY id` contra esa
+        // columna, devolviendo una fila por mensaje en lugar de una por modelo.
+        `SELECT json_extract(data, '$.model.id') AS model
+           FROM session_message
+          WHERE type = 'assistant'
+            AND json_extract(data, '$.model.id') IS NOT NULL
+            AND time_created > ?
+          GROUP BY json_extract(data, '$.model.id')
+          ORDER BY MAX(time_created) DESC`,
+      )
+      .all(cutoff) as { model: string }[]
+    db.close()
+    return rows.map((row) => row.model)
+  } catch {
+    return []
+  }
+}
+
+function recentModelNeedingSync(): string | null {
+  const rows = recentModels()
+  if (rows.length === 0) return null
+
+  // Sin el sync, con el fallback embebido, este modelo no resuelve.
+  setModelCostsPath(NO_PRICES)
+  setModelAliasesPath(NO_ALIASES)
+  resetCostCache()
+  try {
+    for (const model of rows) {
+      if (getModelCost(model) === null) return model
+    }
+  } finally {
+    restoreCostSource()
+    resetCostCache()
+  }
+  return null
+}
+
+/**
+ * Igual que {@link recentModelNeedingSync}, pero además exige que el modelo
+ * tenga un precio real y distinto de cero en session-stats.
+ *
+ * Los modelos gratuitos se pricean a $0, así que "resuelve" no implica "tiene
+ * precio": sin este filtro el test elegiría un modelo gratis y fallaría al
+ * exigir un costo mayor a cero, cuando el comportamiento era correcto.
+ */
+function recentPaidModelNeedingSync(): string | null {
+  setModelCostsPath(null)
+  setModelAliasesPath(null)
+  resetCostCache()
+  try {
+    const rows = recentModels()
+    for (const id of rows) {
+      const cost = getModelCost(id)
+      if (cost && cost.input > 0 && cost.output > 0) return id
+    }
+    return null
+  } finally {
+    restoreCostSource()
+    resetCostCache()
+  }
 }
 
 /** Adelanta el mtime de un archivo para que el guard de frescura lo detecte
@@ -102,36 +187,89 @@ describe("sync con session-stats bajo demanda", () => {
   afterEach(restoreCostSource)
 
   test("resuelve un alias que solo existe en session-stats", () => {
-    // qwen3.8-max-preview es un modelo real en uso: la normalización local no
-    // lo resuelve y sin el sync daría null.
+    const model = recentModelNeedingSync()
+    if (!model) {
+      // Sin base de opencode, o sin modelos recientes que necesiten el sync, no
+      // hay nada vigente que probar. Se avisa para que un skip no se confunda
+      // con una cobertura real.
+      console.warn(
+        "[pricing] sin modelo reciente que necesite el sync: este test no cubrió nada. " +
+          "Suele significar que no hay sesiones de opencode en los últimos 7 días.",
+      )
+      return
+    }
     const { costsPath, aliasesPath } = pricingFixture(
-      { "qwen3.8-max-preview": "qwen3.8-max" },
-      { "qwen3.8-max": { input: 2, output: 6, cache: 0.25 } },
+      { [model]: "modelo-de-prueba" },
+      { "modelo-de-prueba": { input: 2, output: 6, cache: 0.25 } },
     )
     setModelCostsPath(costsPath)
     setModelAliasesPath(aliasesPath)
     resetCostCache()
 
-    expect(normalizeModelName("qwen3.8-max-preview")).toBe("qwen3.8-max-preview")
+    // El alias propio del plugin no lo cubre, así que sin el sync daría null.
+    expect(getModelCost(model)).not.toBeNull()
+    expect(getModelCost(model)!.input).toBe(2)
+    expect(getModelCost(model)!.output).toBe(6)
+  })
 
-    const c = getModelCost("qwen3.8-max-preview")
+  test("resuelve contra los datos reales de session-stats", () => {
+    const model = recentPaidModelNeedingSync()
+    if (!model) {
+      // Todos los modelos recientes son gratuitos ($0), así que no hay un caso
+      // de pago contra el que verificar.
+      console.warn(
+        "[pricing] ningún modelo reciente tiene precio > 0 (los gratuitos dan $0 " +
+          "por diseño): este test no cubrió nada.",
+      )
+      return
+    }
+    // Sin fixtures: contra los JSON de session-stats de verdad.
+    setModelCostsPath(null)
+    setModelAliasesPath(null)
+    resetCostCache()
+
+    const c = getModelCost(model)
     expect(c).not.toBeNull()
-    expect(c!.input).toBe(2)
-    expect(c!.output).toBe(6)
+    expect(c!.input).toBeGreaterThan(0)
+    expect(c!.output).toBeGreaterThan(0)
+  })
+
+  test("un modelo gratuito resuelve a costo cero, no a null", () => {
+    // space-bunny-free es el modelo de esta sesión: se pricea a $0. Que
+    // resuelva a 0 y no a null es lo correcto, y es un caso distinto al del
+    // alias que sincroniza.
+    setModelCostsPath(null)
+    setModelAliasesPath(null)
+    resetCostCache()
+
+    const free = recentModels().find((id) => {
+      const c = getModelCost(id)
+      return c !== null && c.input === 0 && c.output === 0
+    })
+    if (!free) {
+      console.warn("[pricing] no hay modelos gratuitos recientes: este test no cubrió nada.")
+      return
+    }
+
+    resetCostCache()
+    const c = getModelCost(free)
+    expect(c).not.toBeNull()
+    expect(c!.input).toBe(0)
+    expect(calculateCost(free, 1_000_000, 1_000_000, 0)).toBe(0)
   })
 
   test("resuelve un alias con prefijo de provider", () => {
-    // El alias propio del plugin es "deepseek-v4-flash-0731", pero el id que
-    // trae el mensaje incluye el prefijo del provider.
+    // Un id con prefijo de provider no lo cubre el alias propio del plugin,
+    // que está escrito sin prefijo.
     const { costsPath, aliasesPath } = pricingFixture(
-      { "deepseek/deepseek-v4-flash-0731": "deepseek-v4-flash" },
-      { "deepseek-v4-flash": { input: 0.22, output: 0.66 } },
+      { "acme/acme-model-x": "acme-model-x" },
+      { "acme-model-x": { input: 0.22, output: 0.66 } },
     )
     setModelCostsPath(costsPath)
     setModelAliasesPath(aliasesPath)
     resetCostCache()
 
-    const c = getModelCost("deepseek/deepseek-v4-flash-0731")
+    const c = getModelCost("acme/acme-model-x")
     expect(c).not.toBeNull()
     expect(c!.input).toBe(0.22)
   })

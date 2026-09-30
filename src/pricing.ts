@@ -13,9 +13,9 @@
 // ni sincronización al arranque; el camino rápido nunca toca el disco más allá
 // de la primera lectura, y las relecturas se filtran por mtime.
 //
-// MODEL_ALIASES es solo un atajo para los casos frecuentes, y EMBEDDED_COSTS
-// el fallback si session-stats no está instalado. Si un modelo no tiene
-// precio → costo 0 (no rompe nada, solo queda ese request sin costo).
+// MODEL_ALIASES es solo un atajo para los casos frecuentes, y EMBEDDED_COSTS el
+// fallback si session-stats no está instalado. Si un modelo no tiene precio →
+// costo 0 (no rompe nada, solo queda ese request sin costo).
 
 const PROVIDER_PREFIXES = [
   "antigravity-",
