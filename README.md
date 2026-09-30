@@ -7,8 +7,11 @@ the prompt's context window.
 > sponsored by, or associated with Anomaly or OpenCode. Use it at your own
 > risk.
 
+Current release: **0.2.0** — the first version on the OpenCode v2 plugin API.
+See [CHANGELOG.md](CHANGELOG.md) for what changed.
+
 ```text
-tps 12 μ20 ↑80 · 32r ↑88k ↓7k · C 1.0M T 1.1M
+tps 12 μ20 ↑80 · 32r ↑88k ↓7k · C 1.0M T 1.1M · $0.4200
 ```
 
 - `tps 12`: current TPS for the active response, or the last completed response.
@@ -19,9 +22,17 @@ tps 12 μ20 ↑80 · 32r ↑88k ↓7k · C 1.0M T 1.1M
 - `↓7k`: output plus reasoning tokens.
 - `C 1.0M`: cache read and write tokens.
 - `T 1.1M`: input, output, reasoning, and cache tokens combined.
+- `$0.4200`: estimated session cost. Free models show `$0.0000`.
 
-The plugin reads the session totals from the message list the TUI already keeps
-in memory. It does not send telemetry or make network requests.
+Session totals are read from `opencode.db` in read-only mode, because the TUI's
+message list is paginated and would only report a subtotal on long sessions.
+Live TPS uses the TUI's own message list, which is enough for the current and
+recent responses. The plugin does not send telemetry or make network requests.
+
+Prices come from session-stats, read on demand: only when a model fails to
+resolve locally, which is when a new model or a missing price shows up. There
+is no periodic sync. If the database cannot be read the line is hidden rather
+than showing numbers that are not the real ones.
 
 ## Requirements
 
