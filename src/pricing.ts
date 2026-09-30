@@ -6,10 +6,16 @@
 // Para opencode (source sin cache en input), input y cache son separados:
 // el input se cobra full y el cache se suma aparte.
 //
-// Los precios se leen de model_costs.json de session-stats (fuente de verdad)
-// con fallback a un mapa embebido para los modelos críticos si el JSON no
-// está o el modelo no aparece. Si un modelo no tiene precio → costo 0 (no
-// rompe nada, solo queda ese request sin costo).
+// La fuente de verdad es session-stats, que mantiene el mapeo de aliases
+// (model_aliases.json) y el de precios (model_costs.json). La sincronización
+// es bajo demanda: solo ocurre cuando la resolución local falla, es decir
+// cuando aparece un modelo nuevo o falta un precio. No hay timers, polling
+// ni sincronización al arranque; el camino rápido nunca toca el disco más allá
+// de la primera lectura, y las relecturas se filtran por mtime.
+//
+// MODEL_ALIASES es solo un atajo para los casos frecuentes, y EMBEDDED_COSTS
+// el fallback si session-stats no está instalado. Si un modelo no tiene
+// precio → costo 0 (no rompe nada, solo queda ese request sin costo).
 
 const PROVIDER_PREFIXES = [
   "antigravity-",
@@ -61,8 +67,8 @@ export type ModelCost = {
   cache?: number
 }
 
-// Fallback embebido para modelos que session-stats sabe pricear pero que
-// podrían no estar en model_costs.json (p. ej. tras un reset del JSON).
+// Fallback para cuando session-stats no está instalado o su JSON no tiene el
+// modelo. El JSON de session-stats gana siempre cuando está disponible.
 const EMBEDDED_COSTS: Record<string, ModelCost> = {
   "deepseek-v4-flash": { input: 0.14, output: 0.28, cache: 0.0028 },
   "deepseek-v4-pro": { input: 0.435, output: 0.87, cache: 0.0037 },
@@ -81,9 +87,10 @@ const EMBEDDED_COSTS: Record<string, ModelCost> = {
   "tencent/hy3": { input: 0.5, output: 2.6, cache: 0.09 },
 }
 
-// Aliases de modelo clave (modelID opencode → nombre session-stats).
-// deepseek-v4-flash-0731 es el mismo modelo que deepseek-v4-flash (alibaba
-// le agrega la fecha de salida); replicamos el alias del pricing de Hermes.
+// Atajos para los aliases más frecuentes, evaluados antes que los de
+// session-stats. deepseek-v4-flash-0731 es el mismo modelo que
+// deepseek-v4-flash (alibaba le agrega la fecha de salida). El resto llega por
+// el sync bajo demanda, así que esta lista no necesita crecer.
 const MODEL_ALIASES: Record<string, string> = {
   "deepseek-v4-flash-0731": "deepseek-v4-flash",
   "deepseek-v4-flash-free": "deepseek-v4-flash",
@@ -95,7 +102,25 @@ const MODEL_ALIASES: Record<string, string> = {
 }
 
 let _cachedCosts: Record<string, ModelCost> | null = null
+let _costsMtime: number | null = null
 let _costsPath: string | null = null
+let _sessionAliases: Record<string, string> | null = null
+let _aliasesMtime: number | null = null
+let _aliasesPath: string | null = null
+
+function sessionStatsFile(name: string): string {
+  const os = require("os")
+  const path = require("path")
+  return path.join(os.homedir(), "scripts/session-stats", name)
+}
+
+function fileMtime(path: string): number | null {
+  try {
+    return require("fs").statSync(path).mtimeMs
+  } catch {
+    return null
+  }
+}
 
 /**
  * Override de la ubicación de `model_costs.json`. `null` restaura el valor por
@@ -107,19 +132,41 @@ let _costsPath: string | null = null
 export function setModelCostsPath(path: string | null): void {
   _costsPath = path
   _cachedCosts = null
+  _costsMtime = null
 }
 
-function loadModelCosts(): Record<string, ModelCost> {
-  if (_cachedCosts) return _cachedCosts
+/** Override de la ubicación de `model_aliases.json`. Mismo propósito que
+ *  {@link setModelCostsPath}. */
+export function setModelAliasesPath(path: string | null): void {
+  _aliasesPath = path
+  _sessionAliases = null
+  _aliasesMtime = null
+}
+
+function costsPath(): string {
+  return _costsPath ?? sessionStatsFile("model_costs.json")
+}
+
+function aliasesPath(): string {
+  return _aliasesPath ?? sessionStatsFile("model_aliases.json")
+}
+
+/**
+ * Reconstruye el mapa de precios si el archivo de session-stats cambió desde la
+ * última carga. Devuelve el mapa vigente. `checkFreshness` hace el `stat`: solo
+ * se pide desde el camino de fallo, nunca en una resolución exitosa.
+ */
+function loadModelCosts(checkFreshness = false): Record<string, ModelCost> {
+  if (_cachedCosts && !checkFreshness) return _cachedCosts
+  if (_cachedCosts && _costsMtime !== null && _costsMtime === fileMtime(costsPath())) {
+    return _cachedCosts
+  }
   const merged: Record<string, ModelCost> = { ...EMBEDDED_COSTS }
+  const p = costsPath()
   try {
     // model_costs.json de session-stats (fuente de verdad de precios).
-    const fs = require("fs")
-    const os = require("os")
-    const path = require("path")
-    const p = _costsPath ?? path.join(os.homedir(), "scripts/session-stats/model_costs.json")
-    if (fs.existsSync(p)) {
-      const parsed = JSON.parse(fs.readFileSync(p, "utf8"))
+    if (require("fs").existsSync(p)) {
+      const parsed = JSON.parse(require("fs").readFileSync(p, "utf8"))
       for (const [k, v] of Object.entries(parsed)) {
         const c = v as Partial<ModelCost>
         if (c && typeof c === "object") {
@@ -130,6 +177,7 @@ function loadModelCosts(): Record<string, ModelCost> {
           }
         }
       }
+      _costsMtime = fileMtime(p)
     }
   } catch {
     // Si no se puede leer, quedamos con el mapa embebido.
@@ -138,10 +186,46 @@ function loadModelCosts(): Record<string, ModelCost> {
   return merged
 }
 
-export function resetCostCache(): void {
-  _cachedCosts = null
+/**
+ * Mapa de alias de session-stats (`model_aliases.json`, ~150 entradas). Es la
+ * fuente de verdad de las equivalencias entre nombres de modelo; el plugin solo
+ * mantiene las suyas propias como atajo. Se carga bajo demanda: la primera
+ * llamada construye el caché y las siguientes solo comparan el mtime.
+ */
+function loadSessionAliases(checkFreshness = false): Record<string, string> {
+  if (_sessionAliases && !checkFreshness) return _sessionAliases
+  const p = aliasesPath()
+  if (_sessionAliases && _aliasesMtime !== null && _aliasesMtime === fileMtime(p)) {
+    return _sessionAliases
+  }
+  let parsed: Record<string, string> = {}
+  try {
+    if (require("fs").existsSync(p)) {
+      const raw = JSON.parse(require("fs").readFileSync(p, "utf8"))
+      for (const [k, v] of Object.entries(raw)) {
+        if (typeof v === "string" && v) parsed[k] = v
+      }
+      _aliasesMtime = fileMtime(p)
+    }
+  } catch {
+    // Sin aliases de session-stats seguimos con MODEL_ALIASES + affixes.
+  }
+  _sessionAliases = parsed
+  return parsed
 }
 
+export function resetCostCache(): void {
+  _cachedCosts = null
+  _costsMtime = null
+  _sessionAliases = null
+  _aliasesMtime = null
+}
+
+/**
+ * Normalización pura, sin I/O: alias propio del plugin y luego strip de prefijos
+ * de provider y sufijos de variante. Es la forma rápida y la que se usa en
+ * caliente; no consulta los alias de session-stats.
+ */
 export function normalizeModelName(model: string): string {
   if (!model) return "unknown"
   const alias = MODEL_ALIASES[model]
@@ -157,9 +241,48 @@ export function normalizeModelName(model: string): string {
   return name
 }
 
+/**
+ * Resuelve un modelo contra los alias de session-stats. Se invoca únicamente
+ * desde el camino de fallo de {@link getModelCost}, y es el único punto del
+ * plugin que los carga: no hay timers, polling ni sincronización al arranque.
+ *
+ * Replica el orden de `normalize_model_name()` en session-stats, que consulta
+ * su mapa de alias contra el nombre original y contra el nombre ya normalizado.
+ */
+function resolveWithSessionAliases(model: string, costs: Record<string, ModelCost>): ModelCost | null {
+  const aliases = loadSessionAliases(true)
+  const normalized = normalizeModelName(model)
+  for (const key of [model, model.toLowerCase(), normalized]) {
+    if (!key) continue
+    const target = aliases[key]
+    if (target) {
+      const cost = costs[target]
+      if (cost) return cost
+    }
+  }
+  return null
+}
+
+/**
+ * Precio de un modelo, o `null` si no se conoce ninguno.
+ *
+ * El camino rápido solo usa el alias propio del plugin y el mapa de precios ya
+ * cargado, sin tocar el disco. Si eso falla —un modelo nuevo o un precio que
+ * session-stats todavía no tiene— se sincroniza con session-stats una sola vez
+ * y se reintenta. La sincronización es bajo demanda, no periódica.
+ */
 export function getModelCost(model: string): ModelCost | null {
   const normalized = normalizeModelName(model)
-  return loadModelCosts()[normalized] ?? null
+  const local = loadModelCosts()[normalized]
+  if (local) return local
+
+  // Camino de fallo: recargar por si session-stats se actualizó. El precio
+  // puede haber aparecido para este mismo nombre, o el modelo necesitar el mapa
+  // de alias de session-stats para llegar a una clave con precio.
+  const costs = loadModelCosts(true)
+  const refreshed = costs[normalized]
+  if (refreshed) return refreshed
+  return resolveWithSessionAliases(model, costs)
 }
 
 /** Costo en USD para un request de un modelo dado. */
