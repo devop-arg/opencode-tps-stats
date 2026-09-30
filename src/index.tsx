@@ -2,9 +2,12 @@
  * @jsxImportSource @opentui/solid
  */
 
-import type { SessionMessageAssistant, SessionMessageInfo } from "@opencode/client"
+import type { SessionMessageAssistant } from "@opencode/client"
 import type { Context } from "@opencode/plugin/tui/context"
 import { Plugin } from "@opencode/plugin/tui"
+import { Database } from "bun:sqlite"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { averageTPS, completedTPS, formatTPSValue, peakTPS, streamingTPS } from "./tps"
 import { calculateCost, formatCost } from "./pricing"
@@ -17,7 +20,7 @@ function formatTokens(n: number): string {
   return String(n)
 }
 
-function isAssistant(message: SessionMessageInfo): message is SessionMessageAssistant {
+function isAssistant(message: { type: string }): message is SessionMessageAssistant {
   return message.type === "assistant"
 }
 
@@ -40,29 +43,43 @@ type Totals = {
 
 const EMPTY_TOTALS: Totals = { input: 0, output: 0, cache: 0, total: 0, requests: 0, cost: 0 }
 
-// Los totales salen de la lista de mensajes que el host ya mantiene en memoria:
-// en v2 los parts vienen inline en `content` y cada mensaje assistant trae
-// `tokens`, `time` y `model`, así que ya no hace falta leer opencode.db con
-// bun:sqlite como hacía la versión v1. El costo estimado se sigue calculando
-// con el pricing de session-stats (pricing.ts) para que el número coincida con
-// el resto de la Telemetría.
-function readTotals(messages: readonly SessionMessageInfo[]): Totals {
-  const totals: Totals = { ...EMPTY_TOTALS }
-  for (const message of messages) {
-    if (!isAssistant(message)) continue
-    const t = message.tokens
-    if (!t) continue
-    totals.requests++
-    const inTok = t.input ?? 0
-    const outTok = (t.output ?? 0) + (t.reasoning ?? 0)
-    const cacheTok = (t.cache?.read ?? 0) + (t.cache?.write ?? 0)
-    totals.input += inTok
-    totals.output += outTok
-    totals.cache += cacheTok
-    totals.cost += calculateCost(message.model?.id ?? "unknown", inTok, outTok, cacheTok)
+// Los totales salen de opencode.db, no de la lista de mensajes del TUI.
+//
+// `context.data.session.message.list()` devuelve solo una ventana de las últimas
+// decenas de entradas, así que en sesiones largas mostraba un subtotal (unos 27
+// requests de 262 reales). v1 leía la base con bun:sqlite y veía la sesión
+// completa; quedamos igual.
+//
+// La base se lee en modo read-only. Si algo falla se devuelven totales vacíos y
+// la línea se oculta, en vez de mostrar números que no son los reales.
+function readTotalsFromDB(sessionID: string): Totals | null {
+  try {
+    const dbPath = join(homedir(), ".local/share/opencode/opencode.db")
+    const db = new Database(dbPath, { readonly: true })
+    const rows = db
+      .query("SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' ORDER BY time_created")
+      .all(sessionID) as { data: string }[]
+    db.close()
+
+    const totals: Totals = { ...EMPTY_TOTALS }
+    for (const row of rows) {
+      const message = JSON.parse(row.data) as SessionMessageAssistant
+      const t = message.tokens
+      if (!t) continue
+      totals.requests++
+      const inTok = t.input ?? 0
+      const outTok = (t.output ?? 0) + (t.reasoning ?? 0)
+      const cacheTok = (t.cache?.read ?? 0) + (t.cache?.write ?? 0)
+      totals.input += inTok
+      totals.output += outTok
+      totals.cache += cacheTok
+      totals.cost += calculateCost(message.model?.id ?? "unknown", inTok, outTok, cacheTok)
+    }
+    totals.total = totals.input + totals.output + totals.cache
+    return totals
+  } catch {
+    return null
   }
-  totals.total = totals.input + totals.output + totals.cache
-  return totals
 }
 
 function View(props: {
@@ -73,6 +90,9 @@ function View(props: {
   const context = props.context
   const sessionID = props.sessionID
 
+  // La lista del TUI se usa solo para el TPS en vivo y las medias: son datos
+  // del mensaje actual o de los últimos, así que la ventana de la API alcanza.
+  // Los totales de la sesión salen de la base (ver readTotalsFromDB).
   const messages = createMemo<SessionMessageAssistant[]>(() => {
     // props.version() agrega la dependencia reactiva: los eventos del server
     // invalidan la lista.
@@ -135,19 +155,20 @@ function View(props: {
     return `tps ${formatTPSValue(stats.current)} μ${formatTPSValue(stats.average)} ↑${formatTPSValue(stats.peak)} · `
   })
 
-  const totals = createMemo(() => readTotals(messages()))
+  const totals = createMemo(() => readTotalsFromDB(sessionID))
 
   return (
-    <text fg={context.theme.text.muted}>
-      <Show when={tpsLabel()}>
-        {(label) => <>{label()}</>}
-      </Show>
-      {totals().requests}r ↑{formatTokens(totals().input)} ↓{formatTokens(totals().output)}{" "}
-      · C {formatTokens(totals().cache)} T {formatTokens(totals().total)}
-      <Show when={totals().cost > 0}>
-        <> · {formatCost(totals().cost)}</>
-      </Show>
-    </text>
+    <Show when={totals()}>
+      {(t) => (
+        <text fg={context.theme.text.muted}>
+          <Show when={tpsLabel()}>
+            {(label) => <>{label()}</>}
+          </Show>
+          {t().requests}r ↑{formatTokens(t().input)} ↓{formatTokens(t().output)} · C{" "}
+          {formatTokens(t().cache)} T {formatTokens(t().total)} · {formatCost(t().cost)}
+        </text>
+      )}
+    </Show>
   )
 }
 
