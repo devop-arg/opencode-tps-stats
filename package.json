@@ -1,30 +1,31 @@
 {
   "name": "opencode-tps-stats",
-  "version": "0.1.0",
-  "description": "OpenCode TUI plugin showing current, average, and peak TPS with token statistics",
+  "version": "0.2.0",
+  "description": "OpenCode V2 TUI plugin showing current, average, and peak TPS with token statistics",
   "type": "module",
   "exports": {
     "./tui": "./src/index.tsx"
   },
-  "files": ["src"],
+  "files": ["src", "tui.ts"],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
+  "dependencies": {
+    "@opencode/plugin": "^2.0.20"
+  },
   "peerDependencies": {
-    "@opencode-ai/plugin": "*",
-    "@opencode-ai/sdk": "*",
-    "solid-js": "*",
-    "@opentui/solid": "*",
-    "@opentui/core": "*"
+    "@opentui/core": ">=0.5.1",
+    "@opentui/solid": ">=0.5.1",
+    "solid-js": ">=1.9.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.18.13",
-    "@opencode-ai/sdk": "^1.18.13",
-    "solid-js": "*",
-    "@opentui/solid": "^0.5.1",
+    "@opencode/client": "^2.0.20",
+    "@opencode/theme": "^2.0.20",
     "@opentui/core": "^0.5.1",
-    "typescript": "*",
-    "@types/bun": "*"
+    "@opentui/solid": "^0.5.1",
+    "@types/bun": "*",
+    "solid-js": "^1.9.14",
+    "typescript": "*"
   }
 }
